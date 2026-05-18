@@ -281,7 +281,6 @@ export default function AgentChatWidget() {
       }
 
       if (payload.type === "authorization_required" && payload.authorizationUrl) {
-        window.open(payload.authorizationUrl, "_blank", "noopener,noreferrer");
         setIsProcessing(false);
         setMessages((current) => [
           ...current,
