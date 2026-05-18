@@ -1617,7 +1617,7 @@ async function runAgentServer() {
                                         sendJson(socket, {
                                             type: "authorization_required",
                                             authorizationUrl: delegation.authorizationUrl,
-                                            message: `Please approve booking flight ${flightId}. I opened the authorization page in a new tab.`,
+                                            message: `Please approve booking flight ${flightId} by clicking the authorization link below.`,
                                         });
 
                                         return "";
