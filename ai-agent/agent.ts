@@ -360,9 +360,6 @@ type ToolWithSchema = {
     invoke?: (input: Record<string, unknown>) => Promise<unknown> | unknown;
 };
 
-function isToolNamed(tool: ToolWithSchema, name: string) {
-    return tool.name === name || Boolean(tool.name?.endsWith(`_${name}`));
-}
 
 function isJsonSchemaObject(value: unknown): value is JsonSchemaObject {
     return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -505,7 +502,7 @@ function parseChatRequest(payload: string): ParsedChatRequest {
                 messages,
                 mode,
                 orgId,
-                orgName: explicitOrgName ?? inferOrganizationName(messages),
+                orgName: explicitOrgName,
             };
         }
 
@@ -528,7 +525,7 @@ function parseChatRequest(payload: string): ParsedChatRequest {
                     messages,
                     mode,
                     orgId,
-                    orgName: explicitOrgName ?? inferOrganizationName(messages),
+                    orgName: explicitOrgName,
                 };
             }
         }
@@ -692,79 +689,6 @@ async function exchangeOrganizationToken({
     return body.access_token;
 }
 
-function shouldUseDelegatedUserAccess(messages: ChatMessage[]) {
-    const latestMessage = messages[messages.length - 1]?.content.toLowerCase() || "";
-    const delegatedIntentPattern = /\b(update|change|set|invite|add|create|delete|remove|assign|reset|lock|unlock|disable|enable|upgrade|book|booking|reserve|reservation|confirm)\b/;
-
-    return delegatedIntentPattern.test(latestMessage) || Boolean(inferOrganizationName(messages) && hasBookingIntent(messages));
-}
-
-function resolveInvocationMode(request: ParsedChatRequest): ChatInvocationMode {
-    return request.mode ?? (shouldUseDelegatedUserAccess(request.messages) ? "user" : "agent");
-}
-
-function isBookingIntent(messages: ChatMessage[]) {
-    const latestMessage = messages[messages.length - 1]?.content.toLowerCase() || "";
-
-    return /\b(book|booking|reserve|reservation)\b/.test(latestMessage);
-}
-
-function hasBookingIntent(messages: ChatMessage[]) {
-    return messages.some((message) => (
-        message.role === "user" &&
-        /\b(book|booking|reserve|reservation)\b/i.test(message.content)
-    ));
-}
-
-function shouldPrefetchTravelPolicy(messages: ChatMessage[]) {
-    return messages.some((message) => (
-        message.role === "user" &&
-        /\b(book|booking|reserve|reservation|travel\s+policy|policy)\b/i.test(message.content)
-    ));
-}
-
-function isTravelPolicyIntent(messages: ChatMessage[]) {
-    const latestMessage = messages[messages.length - 1]?.content.toLowerCase() || "";
-
-    return /\b(travel\s+policy|policy|eligible flights?|compliant flights?|available flights?|flights? available|show flights?|list flights?|find flights?)\b/.test(latestMessage);
-}
-
-function getUserMessageText(messages: ChatMessage[]) {
-    return messages
-        .filter((message) => message.role === "user")
-        .map((message) => message.content)
-        .join("\n");
-}
-
-function cleanCriteriaValue(value: string) {
-    return value
-        .replace(/\b(on|for|departing|leaving|date|please|thanks|thank you)\b.*$/i, "")
-        .replace(/[.?!,;:]+$/g, "")
-        .trim();
-}
-
-function extractBookingSearchCriteria(messages: ChatMessage[]): BookingSearchCriteria {
-    const text = getUserMessageText(messages);
-    const criteria: BookingSearchCriteria = {};
-    const routeMatch = text.match(/\bfrom\s+(.+?)\s+to\s+(.+?)(?:\s+(?:on|for|departing|leaving|date)\b|[.?!,;]|\n|$)/i);
-
-    if (routeMatch?.[1]) {
-        criteria.from = cleanCriteriaValue(routeMatch[1]);
-    }
-
-    if (routeMatch?.[2]) {
-        criteria.to = cleanCriteriaValue(routeMatch[2]);
-    }
-
-    const dateMatch = text.match(/\b(?:on|for|departing|leaving|date(?: is)?|departure date(?: is)?)\s+([a-z]{3,9}\s+\d{1,2}(?:,\s*\d{4})?|\d{4}-\d{2}-\d{2}|\d{1,2}\/\d{1,2}(?:\/\d{2,4})?|tomorrow|today)\b/i)
-        ?? text.match(/\b((?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+\d{1,2}(?:,\s*\d{4})?)\b/i);
-
-    if (dateMatch?.[1]) {
-        criteria.departureDate = dateMatch[1].trim();
-    }
-
-    return criteria;
-}
 
 
 function normalizeDateText(value: string) {
@@ -859,74 +783,6 @@ function formatTravelPolicyAndFlights(policy: TravelPolicy | null, flights: Sugg
     ].join("\n");
 }
 
-function formatEligibleFlightList(flights: SuggestedFlight[]) {
-    const eligibleFlights = flights.filter((flight) => flight.policyStatus !== "out-of-policy").slice(0, 5);
-
-    if (eligibleFlights.length === 0) {
-        return "I wasn't able to find any available flights matching your criteria right now. You can try a different route, or reach out to your travel administrator for assistance.";
-    }
-
-    const policyBadge = (status: PolicyStatus) =>
-        status === "in-policy" ? "✓ In policy" : "⚠ Needs approval";
-
-    const rows = eligibleFlights.map((flight, index) =>
-        `| ${index + 1} | ${flight.airline} | ${flight.from_city} → ${flight.to_city} | ${flight.departure_time} | ${flight.cabin} | $${flight.price} | ${flight.duration} | ${policyBadge(flight.policyStatus)} |`
-    );
-
-    return [
-        "Here are the available flights for your trip:",
-        "",
-        "| # | Airline | Route | Departure | Class | Price | Duration | Policy |",
-        "|---|---------|-------|-----------|-------|-------|----------|--------|",
-        ...rows,
-        "",
-        "Which one would you like to book? Just reply with the number or flight ID.",
-    ].join("\n");
-}
-
-function resolveRequestedFlightId(messages: ChatMessage[], suggestedFlights: SuggestedFlight[]) {
-    const latestMessage = messages[messages.length - 1]?.content || "";
-    const explicitId = latestMessage.match(/\bflight-[a-z0-9-]+\b/i)?.[0];
-
-    if (explicitId) {
-        if (suggestedFlights.length === 0 || suggestedFlights.some((flight) => flight.id === explicitId)) {
-            return explicitId;
-        }
-
-        return undefined;
-    }
-
-    const ordinalMatch = latestMessage.match(/\b(?:option|flight|number)?\s*(\d{1,2})(?:st|nd|rd|th)?\b/i);
-    const ordinal = ordinalMatch ? Number(ordinalMatch[1]) : NaN;
-
-    if (Number.isInteger(ordinal) && ordinal >= 1 && ordinal <= suggestedFlights.length) {
-        return suggestedFlights[ordinal - 1]?.id;
-    }
-
-    if (/\b(first|cheapest|lowest)\b/i.test(latestMessage)) {
-        return suggestedFlights[0]?.id;
-    }
-
-    return undefined;
-}
-
-function inferOrganizationName(messages: ChatMessage[]) {
-    const latestMessage = messages[messages.length - 1]?.content.trim() || "";
-    const explicitMatch = latestMessage.match(/\b(?:org(?:anization)?|company|tenant)\s*(?:name\s*)?(?:is|=|:)\s*([^,.]+)$/i);
-
-    if (explicitMatch?.[1]) {
-        return explicitMatch[1].trim();
-    }
-
-    const previousMessage = messages[messages.length - 2]?.content.toLowerCase() || "";
-    const latestLooksLikeName = /^[a-z0-9][a-z0-9 _-]{1,64}$/i.test(latestMessage);
-
-    if (latestLooksLikeName && previousMessage.includes("organization")) {
-        return latestMessage;
-    }
-
-    return undefined;
-}
 
 const pendingDelegations = new Map<string, PendingDelegation>();
 
@@ -1361,21 +1217,6 @@ async function getTravelPolicyAndEligibleFlights(
     };
 }
 
-async function prefetchTravelPolicy(runtime: AgentRuntime): Promise<string | null> {
-    const tool = runtime.tools.find((candidate) => isToolNamed(candidate, "get_travel_policy"));
-
-    if (!tool?.invoke) {
-        logger.warn("get_travel_policy tool is not available for deterministic prefetch");
-
-        return null;
-    }
-
-    logger.info("Prefetching travel policy before delegated agent invocation");
-    const result = await tool.invoke({});
-    logger.info("Travel policy prefetch completed");
-
-    return getResponseContent(result);
-}
 
 async function invokeWithDelegatedUserAccess(request: ParsedChatRequest, delegatedAccessToken: string) {
     logger.info({
@@ -1390,18 +1231,7 @@ async function invokeWithDelegatedUserAccess(request: ParsedChatRequest, delegat
     logger.info("Delegated MCP agent runtime is ready");
 
     try {
-        let messages = request.messages;
-
-        if (shouldPrefetchTravelPolicy(request.messages)) {
-            const travelPolicy = await prefetchTravelPolicy(runtime);
-
-            if (travelPolicy) {
-                messages = addContextToFirstUserMessage(
-                    request.messages,
-                    `The active organization travel policy was already retrieved for this turn. Use this policy context before evaluating or booking flights:\n${travelPolicy}`
-                );
-            }
-        }
+        const messages = request.messages;
 
         logger.info("Invoking delegated MCP agent");
         const result = await withTimeout(
@@ -1593,7 +1423,6 @@ async function runAgentServer() {
         const connectionId = randomUUID();
         const connectionLogger = logger.child({ connectionId });
         let isClosed = false;
-        let lastSuggestedFlights: SuggestedFlight[] = [];
 
         connectionLogger.info("WebSocket client connected");
 
@@ -1655,12 +1484,8 @@ async function runAgentServer() {
                                 chatRequest.messages,
                                 `Authenticated organization ID for this chat: ${authenticatedOrgId}`
                             );
-                            const mode = resolveInvocationMode(chatRequest);
-                            const latestMessage = chatRequest.messages[chatRequest.messages.length - 1]?.content || "";
                             const messageLogger = connectionLogger.child({
-                                mode,
                                 messageCount: chatRequest.messages.length,
-                                latestMessageLength: latestMessage.length,
                             });
 
                             if (!sendJson(socket, { type: "processing" })) {
@@ -1669,61 +1494,11 @@ async function runAgentServer() {
                             }
 
                             messageLogger.info("Processing chat message");
-                            const responseMessage = mode === "user"
-                                ? await (async () => {
-                                    if (isBookingIntent(chatRequest.messages)) {
-                                        const flightId = resolveRequestedFlightId(chatRequest.messages, lastSuggestedFlights);
 
-                                        if (!flightId) {
-                                            const criteria = extractBookingSearchCriteria(chatRequest.messages);
-                                            const result = await getTravelPolicyAndEligibleFlights(rootRuntime, authenticatedOrgId, criteria);
-                                            lastSuggestedFlights = result.flights.filter((flight) => flight.policyStatus !== "out-of-policy");
-
-                                            sendJson(socket, {
-                                                type: "response",
-                                                message: formatEligibleFlightList(result.flights),
-                                            });
-
-                                            return "";
-                                        }
-
-                                        const delegation = registerPendingDelegation(socket, chatRequest, flightId);
-
-                                        sendJson(socket, {
-                                            type: "authorization_required",
-                                            authorizationUrl: delegation.authorizationUrl,
-                                            message: `Great choice! To complete your booking, I'll need your authorization. Please click the link below to approve and finalize the reservation for **${flightId}**.`,
-                                        });
-
-                                        return "";
-                                    }
-
-                                    sendJson(socket, {
-                                        type: "response",
-                                        message: "I'm here to help with your business travel! I can look up your organization's travel policy, find available flights, and book a flight for you after a quick authorization step. What would you like to do?",
-                                    });
-
-                                    return "";
-                                })()
-                                : await (async () => {
-                                    if (isTravelPolicyIntent(chatRequest.messages)) {
-                                        const result = await getTravelPolicyAndEligibleFlights(rootRuntime, authenticatedOrgId);
-
-                                        lastSuggestedFlights = result.flights.filter((flight) => flight.policyStatus !== "out-of-policy");
-
-                                        return result.message;
-                                    }
-
-                                    const autonomousRuntime = await getAutonomousRuntime(authenticatedOrgId);
-
-                                    return getResponseContent(
-                                        (await autonomousRuntime.agent.invoke({ messages: llmMessages })).messages.at(-1)?.content
-                                    );
-                                })();
-
-                            if (mode === "user") {
-                                return;
-                            }
+                            const autonomousRuntime = await getAutonomousRuntime(authenticatedOrgId);
+                            const responseMessage = getResponseContent(
+                                (await autonomousRuntime.agent.invoke({ messages: llmMessages })).messages.at(-1)?.content
+                            );
 
                             if (isClosed) {
                                 return;

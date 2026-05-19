@@ -241,8 +241,22 @@ async function getWifToken(): Promise<string> {
     return exchangeWifToken();
 }
 
+async function anthropicFetch(url: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]): Promise<Response> {
+    if (init?.body && typeof init.body === "string") {
+        try {
+            const body = JSON.parse(init.body);
+            delete body.top_p;
+            return fetch(url, { ...init, body: JSON.stringify(body) });
+        } catch { /* fall through */ }
+    }
+    return fetch(url, init);
+}
+
 async function createModel(): Promise<ChatAnthropic> {
     const apiKey = await getWifToken();
+    const modelName = getEnv("CLAUDE_MODEL_NAME") || getEnv("MODEL_NAME") || "claude-sonnet-4-6";
+
+    logger.info({ provider: "anthropic", model: modelName }, "LLM provider initialized");
 
     return new ChatAnthropic({
         apiKey,
@@ -1707,7 +1721,7 @@ async function runAgentServer() {
         logger.info({
             chatUrl: `ws://${host}:${port}/chat`,
             healthUrl: `http://${host}:${port}/health`,
-        }, "AI agent WebSocket server started");
+        }, "AI agent started");
     });
 
     const shutdown = async () => {
