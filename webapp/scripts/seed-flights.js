@@ -572,7 +572,7 @@ db.exec(readFileSync(schemaPath, "utf8"));
 
 const existing = db.prepare("SELECT COUNT(*) as count FROM flights").get();
 if (existing.count > 0 && !force) {
-  console.log(`Flights already seeded (${existing.count} rows). Use --force to re-seed.`);
+  console.log(`Flights already seeded (${existing.count} rows). Use npm run seed:flights -- --force to re-seed.`);
   db.close();
   process.exit(0);
 }

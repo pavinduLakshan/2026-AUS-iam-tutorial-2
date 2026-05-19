@@ -4401,6 +4401,34 @@ select.booking-search-input {
   min-height: 34px;
 }
 
+.booking-cancel-tooltip-wrap {
+  display: inline-block;
+  position: relative;
+}
+
+.booking-cancel-tooltip-wrap::after {
+  content: attr(data-tooltip);
+  position: absolute;
+  bottom: calc(100% + 6px);
+  right: 0;
+  background: #1e293b;
+  color: #f8fafc;
+  font-size: 0.76rem;
+  font-weight: 500;
+  line-height: 1.4;
+  padding: 5px 10px;
+  border-radius: 6px;
+  white-space: nowrap;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+  z-index: 20;
+}
+
+.booking-cancel-tooltip-wrap:hover::after {
+  opacity: 1;
+}
+
 .bookings-section-label {
   color: var(--app-muted);
   font-size: 0.8rem;

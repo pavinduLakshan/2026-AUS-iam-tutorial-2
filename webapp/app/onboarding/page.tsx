@@ -6,6 +6,7 @@ export default function OnboardingPage() {
     <main className="onboarding-page">
       <nav className="detail-nav">
         <Link className="brand" href="/">
+          <img src="/wayfinder-logo.png" className="brand-logo" alt="Wayfinder" />
           Wayfinder
         </Link>
         <Link className="button button-secondary" href="/">
