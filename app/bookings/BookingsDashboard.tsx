@@ -226,6 +226,8 @@ function BookingRow({
   isAdmin?: boolean;
 }) {
   const isConfirmed = booking.status === "confirmed";
+  const canCancel = isAdmin || booking.booked_for_name === null;
+
   return (
     <article className="booking-row">
       <div className="booking-row-info">
@@ -261,13 +263,24 @@ function BookingRow({
           {isConfirmed ? "Confirmed" : "Cancelled"}
         </em>
         {isConfirmed && (
-          <button
-            className="button button-ghost booking-cancel-btn"
-            disabled={isCancelling}
-            onClick={() => onCancel(booking.id)}
-          >
-            {isCancelling ? "Cancelling…" : "Cancel"}
-          </button>
+          canCancel ? (
+            <button
+              className="button button-ghost booking-cancel-btn"
+              disabled={isCancelling}
+              onClick={() => onCancel(booking.id)}
+            >
+              {isCancelling ? "Cancelling…" : "Cancel"}
+            </button>
+          ) : (
+            <span
+              className="booking-cancel-tooltip-wrap"
+              data-tooltip={`Booked by ${booking.booked_by_name} — only they can cancel`}
+            >
+              <button className="button button-ghost booking-cancel-btn" disabled>
+                Cancel
+              </button>
+            </span>
+          )
         )}
       </div>
     </article>
