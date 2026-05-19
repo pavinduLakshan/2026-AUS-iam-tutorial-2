@@ -914,6 +914,7 @@ async function exchangeOboAuthorizationCode(code: string, agentActorToken: strin
             code,
             grant_type: "authorization_code",
             redirect_uri: oboRedirectUri,
+            tokenBindingId: randomUUID(),
         }),
         headers: {
             "Content-Type": "application/x-www-form-urlencoded",
