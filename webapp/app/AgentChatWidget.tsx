@@ -14,12 +14,28 @@ interface ChatMessage {
 }
 
 interface AgentPayload {
+  authorizationRequestId?: string;
   authorizationUrl?: string;
-  type?: "ready" | "processing" | "response" | "error" | "authorization_required";
+  type?: "ready" | "processing" | "response" | "error" | "authorization_required" | "obo_required";
   message?: string;
 }
 
 const AGENT_CHAT_URL = process.env.NEXT_PUBLIC_AGENT_CHAT_URL || "ws://localhost:8791/chat";
+const AGENT_HTTP_BASE_URL = process.env.NEXT_PUBLIC_AGENT_HTTP_BASE_URL || toHttpBaseUrl(AGENT_CHAT_URL);
+
+function toHttpBaseUrl(url: string) {
+  try {
+    const parsed = new URL(url);
+    parsed.protocol = parsed.protocol === "wss:" ? "https:" : "http:";
+    parsed.pathname = "";
+    parsed.search = "";
+    parsed.hash = "";
+
+    return parsed.toString().replace(/\/$/, "");
+  } catch {
+    return "http://localhost:8791";
+  }
+}
 
 function createMessage(role: ChatMessage["role"], content: string): ChatMessage {
   return {
@@ -35,6 +51,24 @@ function toAgentMessages(messages: ChatMessage[]) {
       message.role === "user" || message.role === "assistant" || message.role === "system"
     ))
     .map(({ role, content }) => ({ role, content }));
+}
+
+async function fetchOboAuthorizeUrl(authorizationRequestId: string, accessToken: string) {
+  const response = await fetch(`${AGENT_HTTP_BASE_URL}/obo/authorize-url`, {
+    body: JSON.stringify({ authorizationRequestId }),
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json",
+    },
+    method: "POST",
+  });
+  const body = await response.json().catch(() => ({})) as { authorizationUrl?: string; error?: string };
+
+  if (!response.ok || !body.authorizationUrl) {
+    throw new Error(body.error || "Unable to prepare the authorization link.");
+  }
+
+  return body.authorizationUrl;
 }
 
 function AgentLauncherIcon() {
@@ -251,7 +285,7 @@ export default function AgentChatWidget() {
       setConnectionStatus("connected");
     });
 
-    socket.addEventListener("message", (event) => {
+    socket.addEventListener("message", async (event) => {
       let payload: AgentPayload;
 
       try {
@@ -278,6 +312,35 @@ export default function AgentChatWidget() {
           ...current,
           createMessage("error", payload.message || "The assistant could not process that request."),
         ]);
+      }
+
+      if (payload.type === "obo_required") {
+        setIsProcessing(false);
+
+        if (!payload.authorizationRequestId) {
+          setMessages((current) => [
+            ...current,
+            createMessage("error", "The assistant could not prepare an authorization request."),
+          ]);
+          return;
+        }
+
+        try {
+          const authorizationUrl = await fetchOboAuthorizeUrl(payload.authorizationRequestId, accessToken);
+
+          setMessages((current) => [
+            ...current,
+            {
+              ...createMessage("assistant", payload.message || "Please approve this action to continue."),
+              authorizationUrl,
+            },
+          ]);
+        } catch (error) {
+          setMessages((current) => [
+            ...current,
+            createMessage("error", error instanceof Error ? error.message : "Unable to prepare the authorization link."),
+          ]);
+        }
       }
 
       if (payload.type === "authorization_required" && payload.authorizationUrl) {

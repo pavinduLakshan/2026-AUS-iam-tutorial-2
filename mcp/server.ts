@@ -67,6 +67,17 @@ const host = process.env.HOST || "localhost";
 
 type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
 
+class ApiRequestError extends Error {
+    constructor(
+        message: string,
+        readonly statusCode: number,
+        readonly body: JsonValue,
+    ) {
+        super(message);
+        this.name = "ApiRequestError";
+    }
+}
+
 function decodeJwtPayload(token: string): Record<string, unknown> | null {
     const [, payload] = token.split(".");
 
@@ -129,7 +140,7 @@ function createApiClient(authorization?: string) {
 
         if (!response.ok) {
             apiLogger.warn({ method, path, status: response.status }, "upstream error response");
-            throw new Error(`B2B app request failed with ${response.status}: ${JSON.stringify(body)}`);
+            throw new ApiRequestError(`B2B app request failed with ${response.status}`, response.status, body as JsonValue);
         }
 
         return body as JsonValue;
@@ -157,6 +168,42 @@ function toToolContent(data: JsonValue) {
             },
         ],
     };
+}
+
+function getFailureMessage(error: unknown) {
+    if (error instanceof ApiRequestError) {
+        if (typeof error.body === "object" && error.body !== null && !Array.isArray(error.body)) {
+            const body = error.body as Record<string, JsonValue>;
+
+            if (typeof body.error === "string") {
+                return body.error;
+            }
+
+            if (typeof body.message === "string") {
+                return body.message;
+            }
+        }
+
+        return error.message;
+    }
+
+    return error instanceof Error ? error.message : "The booking request failed.";
+}
+
+function toBookingFailureToolContent(error: unknown) {
+    const message = getFailureMessage(error);
+    const insufficientPermissions = /insufficient permissions/i.test(message);
+
+    return toToolContent({
+        authorizationRequired: insufficientPermissions,
+        error: message,
+        errorCode: insufficientPermissions ? "insufficient_permissions" : "booking_failed",
+        message: insufficientPermissions
+            ? "Insufficient permissions. User authorization is required before creating this booking."
+            : "The flight booking could not be created.",
+        statusCode: error instanceof ApiRequestError ? error.statusCode : 500,
+        success: false,
+    });
 }
 
 function createEnterpriseMcpServer(authorization?: string, reqId?: number) {
@@ -314,15 +361,25 @@ function createEnterpriseMcpServer(authorization?: string, reqId?: number) {
             travelers: z.number().int().min(1).max(9).optional().describe("Number of travelers."),
         },
         ({ bookedByName, bookedForName, bookedForUserId, flightId, travelers }) =>
-            runTool("create_flight_booking", { bookedForUserId, flightId, travelers }, async () =>
-                toToolContent(await api.post("/api/bookings", {
-                    bookedByName: bookedByName ?? "AI-assisted user",
-                    bookedForName: bookedForName ?? "",
-                    bookedForUserId: bookedForUserId ?? "",
-                    flightId,
-                    travelers: travelers ?? 1,
-                })),
-            ),
+            runTool("create_flight_booking", { bookedForUserId, flightId, travelers }, async () => {
+                try {
+                    const bookingResponse = await api.post("/api/bookings", {
+                        bookedByName: bookedByName ?? "AI-assisted user",
+                        bookedForName: bookedForName ?? "",
+                        bookedForUserId: bookedForUserId ?? "",
+                        flightId,
+                        travelers: travelers ?? 1,
+                    });
+
+                    return toToolContent({
+                        data: bookingResponse,
+                        message: "Flight booking created successfully.",
+                        success: true,
+                    });
+                } catch (error) {
+                    return toBookingFailureToolContent(error);
+                }
+            }),
     );
 
     return server;

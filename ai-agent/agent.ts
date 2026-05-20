@@ -14,7 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-import { createServer, type ServerResponse } from "node:http";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomUUID } from "node:crypto";
 import { performance } from "node:perf_hooks";
 import type { Duplex } from "node:stream";
@@ -177,6 +178,15 @@ const delegatedBookingScopes = getEnv("DELEGATED_BOOKING_SCOPES") || "create_boo
 const delegatedUserOrganizationScopes = getEnv("DELEGATED_USER_ORG_SCOPES") || DEFAULT_ORGANIZATION_API_SCOPES;
 const oboRedirectUri = getEnv("OBO_REDIRECT_URI") || new URL("/obo/callback", asgardeoConfig.afterSignInUrl).toString();
 const oboResource = getEnv("OBO_RESOURCE");
+const oboRequiredMessage = "I need your authorization to perform this action. Please click the Authorize button to grant me access.";
+const insufficientPermissionsPattern = /insufficient permissions/i;
+const allowedCorsOrigin = (() => {
+    try {
+        return new URL(appBaseUrl).origin;
+    } catch {
+        return appBaseUrl;
+    }
+})();
 
 type ModelProvider = "gemini" | "openai" | "anthropic" | "deepseek";
 
@@ -339,6 +349,7 @@ type PendingDelegation = {
     flightId?: string;
     orgId?: string;
     request: ParsedChatRequest;
+    scopes: string;
     socket: Duplex;
 };
 
@@ -357,8 +368,15 @@ type JsonSchemaObject = {
 type ToolWithSchema = {
     name?: string;
     schema?: unknown;
-    invoke?: (input: Record<string, unknown>) => Promise<unknown> | unknown;
+    invoke?: (...args: unknown[]) => Promise<unknown> | unknown;
 };
+
+type PermissionTrackingContext = {
+    hasInsufficientPermissions: boolean;
+    toolName?: string;
+};
+
+const permissionTrackingContext = new AsyncLocalStorage<PermissionTrackingContext>();
 
 
 function isJsonSchemaObject(value: unknown): value is JsonSchemaObject {
@@ -786,13 +804,13 @@ function formatTravelPolicyAndFlights(policy: TravelPolicy | null, flights: Sugg
 
 const pendingDelegations = new Map<string, PendingDelegation>();
 
-function buildOboAuthorizeUrl(state: string, request: ParsedChatRequest) {
+function buildOboAuthorizeUrl(state: string, request: ParsedChatRequest, scopes = delegatedBookingScopes) {
     const params = new URLSearchParams({
         client_id: asgardeoConfig.clientId,
         redirect_uri: oboRedirectUri,
         requested_actor: agentConfig.agentID,
         response_type: "code",
-        scope: delegatedBookingScopes,
+        scope: scopes,
         state,
     });
 
@@ -1057,7 +1075,15 @@ function validateAgentConfiguration() {
     }
 }
 
+function writeCorsHeaders(response: ServerResponse) {
+    response.setHeader("Access-Control-Allow-Origin", allowedCorsOrigin);
+    response.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type");
+    response.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    response.setHeader("Vary", "Origin");
+}
+
 function writeHttpJson(response: ServerResponse, statusCode: number, body: Record<string, unknown>) {
+    writeCorsHeaders(response);
     response.writeHead(statusCode, { "Content-Type": "application/json" });
     response.end(JSON.stringify(body));
 }
@@ -1065,6 +1091,79 @@ function writeHttpJson(response: ServerResponse, statusCode: number, body: Recor
 function writeHttpHtml(response: ServerResponse, statusCode: number, body: string) {
     response.writeHead(statusCode, { "Content-Type": "text/html; charset=utf-8" });
     response.end(body);
+}
+
+async function readJsonRequestBody(request: IncomingMessage): Promise<unknown> {
+    const chunks: Buffer[] = [];
+
+    for await (const chunk of request) {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    }
+
+    if (chunks.length === 0) {
+        return undefined;
+    }
+
+    const body = Buffer.concat(chunks).toString("utf8");
+
+    return body ? JSON.parse(body) : undefined;
+}
+
+function isInsufficientPermissionsResponse(value: unknown): boolean {
+    if (typeof value === "string") {
+        return insufficientPermissionsPattern.test(value);
+    }
+
+    if (value instanceof Error) {
+        return insufficientPermissionsPattern.test(value.message);
+    }
+
+    try {
+        return insufficientPermissionsPattern.test(JSON.stringify(value));
+    } catch {
+        return false;
+    }
+}
+
+function markInsufficientPermissions(toolName?: string) {
+    const context = permissionTrackingContext.getStore();
+
+    if (!context) {
+        return;
+    }
+
+    context.hasInsufficientPermissions = true;
+    context.toolName = toolName;
+}
+
+function wrapMcpToolsForPermissionTracking<T extends ToolWithSchema>(tools: T[]): T[] {
+    return tools.map((tool) => {
+        const originalInvoke = tool.invoke?.bind(tool);
+
+        if (!originalInvoke) {
+            return tool;
+        }
+
+        tool.invoke = async (...args: unknown[]) => {
+            try {
+                const result = await originalInvoke(...args);
+
+                if (isInsufficientPermissionsResponse(result)) {
+                    markInsufficientPermissions(tool.name);
+                }
+
+                return result;
+            } catch (error) {
+                if (isInsufficientPermissionsResponse(error)) {
+                    markInsufficientPermissions(tool.name);
+                }
+
+                throw error;
+            }
+        };
+
+        return tool;
+    });
 }
 
 async function createMcpAgent(authorization: string, mode: ChatInvocationMode): Promise<AgentRuntime> {
@@ -1079,7 +1178,8 @@ async function createMcpAgent(authorization: string, mode: ChatInvocationMode): 
     });
 
     const rawTools = await client.getTools();
-    const tools = modelProvider === "gemini" ? sanitizeToolSchemasForGemini(rawTools) : rawTools;
+    const sanitizedTools = modelProvider === "gemini" ? sanitizeToolSchemasForGemini(rawTools) : rawTools;
+    const tools = wrapMcpToolsForPermissionTracking(sanitizedTools);
     logger.info({
         mode,
         tools: tools.map((tool) => tool.name).filter(Boolean),
@@ -1273,7 +1373,12 @@ async function createBookingWithDelegatedUserAccess(pending: PendingDelegation, 
         : `Booked flight ${pending.flightId}.`;
 }
 
-function registerPendingDelegation(socket: Duplex, request: ParsedChatRequest, flightId?: string) {
+function registerPendingDelegation(
+    socket: Duplex,
+    request: ParsedChatRequest,
+    flightId?: string,
+    scopes = delegatedBookingScopes
+) {
     const state = randomUUID();
 
     pendingDelegations.set(state, {
@@ -1281,11 +1386,13 @@ function registerPendingDelegation(socket: Duplex, request: ParsedChatRequest, f
         flightId,
         orgId: request.orgId,
         request,
+        scopes,
         socket,
     });
 
     return {
-        authorizationUrl: buildOboAuthorizeUrl(state, request),
+        authorizationRequestId: state,
+        authorizationUrl: buildOboAuthorizeUrl(state, request, scopes),
         state,
     };
 }
@@ -1298,6 +1405,66 @@ function removeExpiredPendingDelegations() {
             pendingDelegations.delete(state);
         }
     }
+}
+
+async function handleOboAuthorizeUrlRequest(request: IncomingMessage, response: ServerResponse) {
+    if (request.method === "OPTIONS") {
+        writeCorsHeaders(response);
+        response.writeHead(204);
+        response.end();
+
+        return;
+    }
+
+    if (request.method !== "POST") {
+        writeHttpJson(response, 405, { error: "Method not allowed" });
+
+        return;
+    }
+
+    removeExpiredPendingDelegations();
+
+    let body: unknown;
+
+    try {
+        body = await readJsonRequestBody(request);
+    } catch {
+        writeHttpJson(response, 400, { error: "Invalid JSON body." });
+
+        return;
+    }
+
+    const authorizationRequestId = typeof body === "object" && body !== null
+        ? (body as { authorizationRequestId?: unknown }).authorizationRequestId
+        : undefined;
+    const state = typeof authorizationRequestId === "string" ? authorizationRequestId.trim() : "";
+
+    if (!state) {
+        writeHttpJson(response, 400, { error: "authorizationRequestId is required." });
+
+        return;
+    }
+
+    const pending = pendingDelegations.get(state);
+
+    if (!pending) {
+        writeHttpJson(response, 404, { error: "Authorization request not found or expired." });
+
+        return;
+    }
+
+    const callerToken = getBearerToken(request.headers.authorization);
+    const callerOrgId = getTokenOrganizationId(callerToken);
+
+    if (!callerToken || !callerOrgId || (pending.orgId && pending.orgId !== callerOrgId)) {
+        writeHttpJson(response, 401, { error: "Unauthorized." });
+
+        return;
+    }
+
+    writeHttpJson(response, 200, {
+        authorizationUrl: buildOboAuthorizeUrl(state, pending.request, pending.scopes),
+    });
 }
 
 async function handleOboCallback(url: URL, response: ServerResponse, agentActorToken?: string) {
@@ -1404,6 +1571,12 @@ async function runAgentServer() {
             return;
         }
 
+        if (url.pathname === "/obo/authorize-url") {
+            await handleOboAuthorizeUrlRequest(request, response);
+
+            return;
+        }
+
         if (url.pathname === "/health") {
             writeHttpJson(response, 200, {
                 status: "ok",
@@ -1495,12 +1668,73 @@ async function runAgentServer() {
 
                             messageLogger.info("Processing chat message");
 
-                            const autonomousRuntime = await getAutonomousRuntime(authenticatedOrgId);
-                            const responseMessage = getResponseContent(
-                                (await autonomousRuntime.agent.invoke({ messages: llmMessages })).messages.at(-1)?.content
-                            );
+                            let responseMessage: string;
+                            const permissionTracking: PermissionTrackingContext = {
+                                hasInsufficientPermissions: false,
+                            };
+
+                            try {
+                                const autonomousRuntime = await getAutonomousRuntime(authenticatedOrgId);
+                                const result = await permissionTrackingContext.run(
+                                    permissionTracking,
+                                    () => autonomousRuntime.agent.invoke({ messages: llmMessages })
+                                );
+
+                                responseMessage = getResponseContent(
+                                    result.messages.at(-1)?.content
+                                );
+                            } catch (error) {
+                                if (isInsufficientPermissionsResponse(error)) {
+                                    markInsufficientPermissions();
+                                    permissionTracking.hasInsufficientPermissions = true;
+                                }
+
+                                if (permissionTracking.hasInsufficientPermissions) {
+                                    const { authorizationRequestId } = registerPendingDelegation(
+                                        socket,
+                                        chatRequest,
+                                        undefined,
+                                        delegatedUserOrganizationScopes
+                                    );
+
+                                    sendJson(socket, {
+                                        type: "obo_required",
+                                        message: oboRequiredMessage,
+                                        authorizationRequestId,
+                                    });
+                                    messageLogger.info({
+                                        authorizationRequestId,
+                                        toolName: permissionTracking.toolName,
+                                    }, "Delegated authorization required after MCP permission error");
+
+                                    return;
+                                }
+
+                                throw error;
+                            }
 
                             if (isClosed) {
+                                return;
+                            }
+
+                            if (permissionTracking.hasInsufficientPermissions || isInsufficientPermissionsResponse(responseMessage)) {
+                                const { authorizationRequestId } = registerPendingDelegation(
+                                    socket,
+                                    chatRequest,
+                                    undefined,
+                                    delegatedUserOrganizationScopes
+                                );
+
+                                sendJson(socket, {
+                                    type: "obo_required",
+                                    message: oboRequiredMessage,
+                                    authorizationRequestId,
+                                });
+                                messageLogger.info({
+                                    authorizationRequestId,
+                                    toolName: permissionTracking.toolName,
+                                }, "Delegated authorization required after MCP permission response");
+
                                 return;
                             }
 
