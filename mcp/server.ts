@@ -245,19 +245,6 @@ function createEnterpriseMcpServer(authorization?: string, reqId?: number) {
     }
 
     server.tool(
-        "get_current_access_context",
-        "Get the authenticated subject, actor, roles, organization, and scopes from the current access token.",
-        {},
-        () => runTool("get_current_access_context", {}, async () => toToolContent({
-            actor: tokenPayload?.act ?? null,
-            organizationId: tokenContext.org_id ?? "",
-            roles: tokenContext.roles,
-            scopes: typeof tokenPayload?.scope === "string" ? tokenPayload.scope.split(" ") : [],
-            subject: tokenContext.sub ?? "",
-        } as JsonValue)),
-    );
-
-    server.tool(
         "get_travel_policy",
         "Get the active travel policy for the authenticated organization. Use this before answering travel-policy questions and before creating a flight booking.",
         {},
